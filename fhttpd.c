@@ -4,10 +4,13 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <string.h>
+#include <fcntl.h>
 
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
 
 #include <pthread.h>
 
@@ -17,6 +20,17 @@
 
 // 浏览器的请求类型
 enum RequestType{REQUEST_GET, REQUEST_POST, REQUEST_UNDEFINED};
+
+// 解决有时候bind套接字时，出现的98号错误--端口被占用
+// 套接字应用 SO_REUSEADDR 套接字选项，以便端口可以马上重用
+void reuseAddr(int socketFd){
+    int on = 1;
+    int ret = setsockopt(socketFd,SOL_SOCKET,SO_REUSEADDR,&on,sizeof(on));
+    if(ret==-1){
+        fprintf(stderr, "Error : fail to setsockopt\n");
+        exit(1);
+    }
+}
 
 //在本机启动tcp服务
 int startTcpServer(int portNum){
@@ -34,6 +48,7 @@ int startTcpServer(int portNum){
     tcpServerSockAddr.sin_port = htons(portNum);
     //地址0.0.0.0 表示本机
     tcpServerSockAddr.sin_addr.s_addr = 0;
+    reuseAddr(httpdSocket);
     if(bind(httpdSocket,(const struct sockaddr*)&tcpServerSockAddr,
         sizeof(tcpServerSockAddr))==-1){
         fprintf(stderr, "Error: can't bind port %d,errno is %d\n",portNum,errno);
@@ -165,7 +180,6 @@ void responseStaticFile(int socketFd, int returnNum, char* filePath,
 
     sprintf(sendBuf, "Content-type: %s\r\n", contentType);
     socketSendMsg(socketFd, sendBuf);
-
     socketSendMsg(socketFd, "\r\n");
     
     //向浏览器发送文件
@@ -178,6 +192,41 @@ void responseStaticFile(int socketFd, int returnNum, char* filePath,
     fclose(pFile);
 }
 
+// 执行cgi程序，并获取动态页面
+void execCGI(int socketFd,char* requestFilePath,char* requestQueryString){
+    int pipefd[2];
+    printf("###%s\n",requestQueryString);
+    if(pipe(pipefd)==-1){
+        fprintf(stderr, "ERROR : 创建匿名管道失败，失败号 %d\n", errno);
+        return;
+    }
+
+    //先发送 http 协议信息头
+    socketSendMsg(socketFd,"HTTP/1.0 200 OK\r\nContent-type: text/html\r\n\r\n");
+
+    int pid = fork();
+
+    if(pid==0){
+        // 子进程执行
+        // 将输出重定位到管道的写
+        dup2(pipefd[1],1);
+        // execl的参数可变，但最好设置最后一个参数为NULL,作为哨兵,否则会有警告
+        execl(requestFilePath, requestFilePath, requestQueryString, NULL);
+        
+    }else{
+        // 父进程执行
+        // 对于管道只读不写
+        char sendData[SEND_BUF_SIZE] = {0};
+        int readLength = 0;
+        do{
+            readLength = read(pipefd[0], sendData, SEND_BUF_SIZE);
+            if(readLength==0)break;
+            write(socketFd, sendData, readLength);
+        }while(readLength==SEND_BUF_SIZE);
+        waitpid(pid,NULL,0);
+    }
+}
+
 //线程: 接收浏览器端的数据,并返回一个http包
 void* responseBrowserRequest(void* ptr){
     int browserSocket = *(int*)ptr;
@@ -187,12 +236,15 @@ void* responseBrowserRequest(void* ptr){
     enum RequestType requestType = REQUEST_UNDEFINED;
     
     // 定义存放请求文件名的内存块
-    #define FILE_NAME_LENGTH 128
-    char requestFileName[FILE_NAME_LENGTH] = {0};
+    #define FILE_PATH_LENGTH 128
+    char requestFilePath[FILE_PATH_LENGTH] = {0};
 
     // 定义存放查询参数字符串的内存库
     #define QUERY_STRING_LENGTH 128
     char requestQueryString[QUERY_STRING_LENGTH] = {0};
+
+    // 请求的文件是否为可执行文件(需要动态生成页面)
+    int isXFile = 0;
 
     // 将 http数据包的信息头读完(信息头和正文间以空行分隔)
     while(getOneLineFromSocket(browserSocket,recvBuf,RECV_BUF_SIZE)){
@@ -219,17 +271,17 @@ void* responseBrowserRequest(void* ptr){
 
             // 获取请求的文件路径 查询参数
             if(pRecvBuf){
-                requestFileName[pFileName++] = '.';
-                while(pFileName<FILE_NAME_LENGTH && recvBuf[pRecvBuf]
+                requestFilePath[pFileName++] = '.';
+                while(pFileName<FILE_PATH_LENGTH && recvBuf[pRecvBuf]
                     && recvBuf[pRecvBuf]!=' ' && recvBuf[pRecvBuf]!='?'){
-                    requestFileName[pFileName++] = recvBuf[pRecvBuf++];
+                    requestFilePath[pFileName++] = recvBuf[pRecvBuf++];
                 }
 
-                if(pFileName<FILE_NAME_LENGTH && recvBuf[pRecvBuf]=='?'){
+                if(pFileName<FILE_PATH_LENGTH && recvBuf[pRecvBuf]=='?'){
                     ++pRecvBuf;
                     while(pQueryString<QUERY_STRING_LENGTH && 
                         recvBuf[pRecvBuf] && recvBuf[pRecvBuf]!=' '){
-                        requestQueryString[pQueryString++] = recvBuf[pRecvBuf];
+                        requestQueryString[pQueryString++] = recvBuf[pRecvBuf++];
                     }
                 }
             }
@@ -251,13 +303,36 @@ void* responseBrowserRequest(void* ptr){
         }
         read(browserSocket, requestQueryString, contentLength);
     }
+    
+    // 判断请求的文件是否是文件夹
+    struct stat fileInfo;
+    stat(requestFilePath,&fileInfo);
+    if(S_ISDIR(fileInfo.st_mode)){
+        //是文件夹的情况
+    }else{
+        //非文件夹的情况
+        // 判断请求的文件是否是可执行文件
+        if(access(requestFilePath,X_OK)==0){
+            isXFile = 1;
+        }
+    }
+
     switch(requestType){
         case REQUEST_GET:
-            {
-                responseStaticFile(browserSocket,200,requestFileName,NULL);
+            if(isXFile==0){
+                responseStaticFile(browserSocket,200,requestFilePath,NULL);
+            }else{
+                execCGI(browserSocket,requestFilePath,requestQueryString);
             }
             break;
         case REQUEST_POST:
+            {
+                if(contentLength==0){
+                    responseStaticFile(browserSocket,400,"./err400.html","text/html");
+                    break;
+                }
+                execCGI(browserSocket,requestFilePath,requestQueryString);
+            }
             break;
         case REQUEST_UNDEFINED:
             {
@@ -267,6 +342,7 @@ void* responseBrowserRequest(void* ptr){
         default:
             break;
     }
+    
     close(browserSocket);
     return NULL;
 }

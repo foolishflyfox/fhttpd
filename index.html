@@ -5,10 +5,31 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="X-UA-Compatible" content="ie=edge">
     <title>fhttpd</title>
+    <script>
+        function checkUserName(){
+            var username = document.getElementById("username").value;
+            console.log(username);
+            if(username==""){
+                alert("请输入用户名!");
+                return false;
+            }else{
+                return true;
+            }
+        }
+    </script>
 </head>
 <body>
-    <h1 style="color:deep-blue-sky">
-        Hello,world!
-    </h1>
+    <form align="center" action="./login.cgi" onsubmit="return checkUserName();" method="post">
+        <h2 style="color:deepskyblue;">
+            用户登录
+        </h2>
+        <label for="username">用户名：</label>
+        <input type="text" name="username" id="username">
+        <br><br>
+        <label for="password">密码 &nbsp; ：</label>
+        <input type="password" name="password">
+        <br><br>
+        <input type="submit" value="Sign in">
+    </form>
 </body>
 </html>
